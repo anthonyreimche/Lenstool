@@ -1,28 +1,51 @@
 """Main application window with docking panels, menus, and toolbars."""
 
 import os
-from PyQt6.QtWidgets import (QMainWindow, QDockWidget, QTabWidget, QMenuBar,
-                              QToolBar, QStatusBar, QFileDialog, QMessageBox,
-                              QApplication, QWidget, QVBoxLayout, QLabel,
-                              QSplitter)
-from PyQt6.QtCore import Qt, QTimer, QSize
+
+from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDockWidget,
+    QFileDialog,
+    QLabel,
+    QMainWindow,
+    QMenuBar,
+    QMessageBox,
+    QSplitter,
+    QStatusBar,
+    QTabWidget,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
 
-from ..engine.surface import LensSystem
-from ..engine.fileio import (save_lens, load_lens, create_sample_doublet,
-                              create_sample_cooke_triplet, create_sample_singlet,
-                              create_sample_double_gauss, create_sample_petzval,
-                              create_sample_telephoto, create_sample_landscape)
-from ..engine.raytrace import compute_efl
 from ..engine.analysis import system_summary
-
-from .theme import DARK_STYLESHEET
-from .lens_editor import LensDataEditor
+from ..engine.fileio import (
+    create_sample_cooke_triplet,
+    create_sample_double_gauss,
+    create_sample_doublet,
+    create_sample_landscape,
+    create_sample_petzval,
+    create_sample_singlet,
+    create_sample_telephoto,
+    load_lens,
+    save_lens,
+)
+from ..engine.raytrace import compute_efl
+from ..engine.surface import LensSystem
+from .analysis_plots import (
+    FieldCurvatureWidget,
+    MTFWidget,
+    RayFanWidget,
+    SpotDiagramWidget,
+    SystemInfoWidget,
+)
+from .dialogs import GlassCatalogDialog, PrefabCatalogDialog, SystemSettingsDialog
 from .layout_viewer import LayoutViewer
-from .analysis_plots import (SpotDiagramWidget, MTFWidget, RayFanWidget,
-                              FieldCurvatureWidget, SystemInfoWidget)
+from .lens_editor import LensDataEditor
 from .optimization_widget import OptimizationWidget
-from .dialogs import (SystemSettingsDialog, GlassCatalogDialog)
+from .theme import DARK_STYLESHEET
 
 
 class MainWindow(QMainWindow):
@@ -84,7 +107,9 @@ class MainWindow(QMainWindow):
         samples_menu.addAction(doublet)
 
         triplet = QAction("Cooke Triplet", self)
-        triplet.triggered.connect(lambda: self._load_sample(create_sample_cooke_triplet))
+        triplet.triggered.connect(
+            lambda: self._load_sample(create_sample_cooke_triplet)
+        )
         samples_menu.addAction(triplet)
 
         dgauss = QAction("Double Gauss", self)
@@ -134,6 +159,11 @@ class MainWindow(QMainWindow):
         glass_catalog.setShortcut(QKeySequence("Ctrl+G"))
         glass_catalog.triggered.connect(self._show_glass_catalog)
         edit_menu.addAction(glass_catalog)
+
+        prefab_catalog = QAction("Prefab Element Catalog...", self)
+        prefab_catalog.setShortcut(QKeySequence("Ctrl+P"))
+        prefab_catalog.triggered.connect(self._show_prefab_catalog)
+        edit_menu.addAction(prefab_catalog)
 
         # Analysis menu
         analysis_menu = menubar.addMenu("&Analysis")
@@ -200,6 +230,7 @@ class MainWindow(QMainWindow):
             None,  # separator
             ("Settings", self._show_system_settings),
             ("Glass", self._show_glass_catalog),
+            ("Prefab", self._show_prefab_catalog),
             None,
             ("Spot", lambda: self._show_analysis_tab(0)),
             ("MTF", lambda: self._show_analysis_tab(1)),
@@ -278,7 +309,12 @@ class MainWindow(QMainWindow):
         self.status_track = QLabel("Track: --")
         self.status_surfs = QLabel("Surfaces: --")
 
-        for label in [self.status_efl, self.status_fno, self.status_track, self.status_surfs]:
+        for label in [
+            self.status_efl,
+            self.status_fno,
+            self.status_track,
+            self.status_surfs,
+        ]:
             label.setStyleSheet("padding: 0 12px;")
             self.statusbar.addPermanentWidget(label)
 
@@ -322,13 +358,19 @@ class MainWindow(QMainWindow):
         self._refresh_analysis_tab(idx)
 
     def _refresh_analysis_tab(self, idx):
-        widgets = [self.spot_widget, self.mtf_widget, self.rayfan_widget,
-                   self.fc_widget, self.info_widget, self.opt_widget]
+        widgets = [
+            self.spot_widget,
+            self.mtf_widget,
+            self.rayfan_widget,
+            self.fc_widget,
+            self.info_widget,
+            self.opt_widget,
+        ]
         if 0 <= idx < len(widgets):
             widget = widgets[idx]
-            if hasattr(widget, 'update_plot'):
+            if hasattr(widget, "update_plot"):
                 widget.update_plot()
-            elif hasattr(widget, 'update_info'):
+            elif hasattr(widget, "update_info"):
                 widget.update_info()
 
     def _show_analysis_tab(self, idx):
@@ -356,8 +398,8 @@ class MainWindow(QMainWindow):
 
     def _open_file(self):
         filepath, _ = QFileDialog.getOpenFileName(
-            self, "Open Lens File", "",
-            "Lens Files (*.lens *.json);;All Files (*)")
+            self, "Open Lens File", "", "Lens Files (*.lens *.json);;All Files (*)"
+        )
         if filepath:
             try:
                 system = load_lens(filepath)
@@ -378,8 +420,11 @@ class MainWindow(QMainWindow):
 
     def _save_file_as(self):
         filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Lens File", f"{self.system.title}.lens",
-            "Lens Files (*.lens);;JSON Files (*.json);;All Files (*)")
+            self,
+            "Save Lens File",
+            f"{self.system.title}.lens",
+            "Lens Files (*.lens);;JSON Files (*.json);;All Files (*)",
+        )
         if filepath:
             try:
                 save_lens(self.system, filepath)
@@ -405,6 +450,10 @@ class MainWindow(QMainWindow):
         dlg.exec()
         self.editor.refresh()
 
+    def _show_prefab_catalog(self):
+        dlg = PrefabCatalogDialog(self, select_mode=False)
+        dlg.exec()
+
     def _show_optimization(self):
         """Switch to the Optimize tab in the analysis panel."""
         # Find the optimize tab index
@@ -422,16 +471,20 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _show_about(self):
-        QMessageBox.about(self, "About LensTool",
-                          "<h2 style='color: #89b4fa;'>LensTool v1.0</h2>"
-                          "<p>Optical Lens Design Program</p>"
-                          "<p style='color: #a6adc8;'>Features:</p>"
-                          "<ul>"
-                          "<li>Sequential ray tracing</li>"
-                          "<li>Spot diagrams, MTF, ray fans</li>"
-                          "<li>Field curvature & distortion</li>"
-                          "<li>Seidel aberration analysis</li>"
-                          "<li>DLS optimization</li>"
-                          "<li>Glass catalog (Sellmeier)</li>"
-                          "<li>Sample lens library</li>"
-                          "</ul>")
+        QMessageBox.about(
+            self,
+            "About LensTool",
+            "<h2 style='color: #89b4fa;'>LensTool v1.0</h2>"
+            "<p>Optical Lens Design Program</p>"
+            "<p style='color: #a6adc8;'>Features:</p>"
+            "<ul>"
+            "<li>Sequential ray tracing</li>"
+            "<li>Spot diagrams, MTF, ray fans</li>"
+            "<li>Field curvature & distortion</li>"
+            "<li>Seidel aberration analysis</li>"
+            "<li>DLS optimization</li>"
+            "<li>Glass catalog (Sellmeier)</li>"
+            "<li>Sample lens library</li>"
+            "<p>Created by Anthony Reimche</p>"
+            "</ul>",
+        )

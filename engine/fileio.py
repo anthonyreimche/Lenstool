@@ -3,7 +3,7 @@
 import json
 import os
 from typing import Optional
-from .surface import LensSystem, Surface, SurfaceType
+from .surface import LensSystem, Surface, SurfaceType, SolveType
 
 
 def _auto_bfl(system: LensSystem):
@@ -48,6 +48,13 @@ def save_lens(system: LensSystem, filepath: str):
         }
         if surf.aspheric_coeffs:
             s["aspheric_coeffs"] = surf.aspheric_coeffs
+        # Save solve types (only non-default to keep files clean)
+        if surf.radius_solve != SolveType.FIXED:
+            s["radius_solve"] = surf.radius_solve.value
+        if surf.thickness_solve != SolveType.FIXED:
+            s["thickness_solve"] = surf.thickness_solve.value
+        if surf.material_solve != SolveType.FIXED:
+            s["material_solve"] = surf.material_solve.value
         data["surfaces"].append(s)
 
     with open(filepath, 'w') as f:
@@ -81,6 +88,13 @@ def load_lens(filepath: str) -> LensSystem:
             is_stop=s.get("is_stop", False),
             aspheric_coeffs=s.get("aspheric_coeffs", []),
         )
+        # Load solve types
+        if "radius_solve" in s:
+            surf.radius_solve = SolveType(s["radius_solve"])
+        if "thickness_solve" in s:
+            surf.thickness_solve = SolveType(s["thickness_solve"])
+        if "material_solve" in s:
+            surf.material_solve = SolveType(s["material_solve"])
         system.surfaces.append(surf)
 
     if not system.surfaces:

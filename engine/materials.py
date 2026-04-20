@@ -216,3 +216,37 @@ def load_glass_catalog(filepath: str) -> int:
             C1=g.get("C1", 0.0), C2=g.get("C2", 0.0), C3=g.get("C3", 0.0))
         count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Glass search utilities (used by material optimizer & prefab matching)
+# ---------------------------------------------------------------------------
+
+def find_nearest_glass(nd: float, vd: float,
+                       candidates: list = None,
+                       max_results: int = 5) -> list:
+    """Find glasses closest to (nd, vd) in the catalog.
+
+    Returns list of (glass_name, distance) sorted by distance.
+    *candidates* may restrict the search to a subset of glass names.
+    Distance is Euclidean in (nd, vd/100) space so both axes
+    contribute roughly equally.
+    """
+    pool = candidates or list(GLASS_CATALOG.keys())
+    results = []
+    for name in pool:
+        glass = GLASS_CATALOG.get(name.upper())
+        if glass is None or name.upper() == "MIRROR":
+            continue
+        d = np.sqrt((glass.nd - nd) ** 2 + ((glass.vd - vd) / 100.0) ** 2)
+        results.append((glass.name, d))
+    results.sort(key=lambda x: x[1])
+    return results[:max_results]
+
+
+def glass_nd_vd(name: str):
+    """Return (nd, vd) for a named glass, or (1.5, 50.0) if not found."""
+    g = get_glass(name)
+    if g is None:
+        return 1.5, 50.0
+    return g.nd, g.vd

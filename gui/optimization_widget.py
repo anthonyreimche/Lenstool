@@ -10,6 +10,7 @@ from PyQt6.QtGui import QColor
 
 from ..engine.surface import LensSystem, SolveType
 from ..engine.optimizer import Optimizer, OptimizationResult
+from ..engine.materials import GLASS_CATALOG
 
 
 # ---- Operand definitions ----
@@ -40,8 +41,23 @@ class _OptThread(QThread):
         self.finished_signal.emit(result)
 
 
+class _GlassSubThread(QThread):
+    """Run glass substitution in a background thread."""
+    progress = pyqtSignal(int, float)
+    finished_signal = pyqtSignal(object)
+
+    def __init__(self, optimizer):
+        super().__init__()
+        self.optimizer = optimizer
+
+    def run(self):
+        result = self.optimizer.glass_substitution(
+            callback=lambda n, m: self.progress.emit(n, m))
+        self.finished_signal.emit(result)
+
+
 class OptimizationWidget(QWidget):
-    """Inline optimization panel that reads V-marked variables from the editor."""
+    """Inline optimization panel that reads V/G-marked variables from the editor."""
 
     optimization_complete = pyqtSignal()
 
@@ -67,14 +83,15 @@ class OptimizationWidget(QWidget):
         root.setContentsMargins(6, 6, 6, 6)
 
         # ---- Variables summary ----
-        var_box = QGroupBox("Variables  (mark V in Radius/Thickness columns)")
+        var_box = QGroupBox("Variables  (mark V in Radius/Thickness, G in Material)")
         var_box.setToolTip(
-            "Variables are auto-collected from the lens editor. Type a value "
-            "followed by 'V' in any Radius or Thickness cell (e.g. '61.47 V') "
-            "or right-click → Make Radius/Thickness Variable.")
+            "Variables are auto-collected from the lens editor.\n"
+            "  V = vary geometry (e.g. '61.47 V' in Radius/Thickness)\n"
+            "  G = vary glass material (e.g. 'BK7 G' in Material)\n"
+            "Right-click a cell for quick toggles.")
         var_lay = QVBoxLayout(var_box)
 
-        self.var_label = QLabel("No variables. Mark parameters with V in the editor.")
+        self.var_label = QLabel("No variables. Mark parameters with V or G in the editor.")
         self.var_label.setWordWrap(True)
         self.var_label.setStyleSheet("color: #a6adc8;")
         var_lay.addWidget(self.var_label)
@@ -157,6 +174,7 @@ class OptimizationWidget(QWidget):
         root.addWidget(self.progress_bar)
 
         self.merit_label = QLabel("Merit: --")
+        self.merit_label.setWordWrap(True)
         self.merit_label.setToolTip(
             "Current merit function value. Lower = better. Zero = perfect.")
         root.addWidget(self.merit_label)
@@ -169,10 +187,21 @@ class OptimizationWidget(QWidget):
         self.btn_evaluate.clicked.connect(self._evaluate)
         action_btns.addWidget(self.btn_evaluate)
 
+        self.btn_glass_sub = QPushButton("Glass Sub.")
+        self.btn_glass_sub.setToolTip(
+            "Brute-force glass substitution: try every catalog glass\n"
+            "for each G-marked material and keep the best.\n"
+            "Run after DLS for optimal results.")
+        self.btn_glass_sub.clicked.connect(self._run_glass_sub)
+        self.btn_glass_sub.setEnabled(False)
+        action_btns.addWidget(self.btn_glass_sub)
+
         self.btn_optimize = QPushButton("Optimize")
         self.btn_optimize.setObjectName("primaryButton")
         self.btn_optimize.setToolTip(
-            "Run DLS to minimize the merit function. The lens is updated in-place.")
+            "Run DLS to minimize the merit function.\n"
+            "G-marked materials are optimized as continuous (nd,vd)\n"
+            "then snapped to the nearest real catalog glass.")
         self.btn_optimize.clicked.connect(self._run)
         action_btns.addWidget(self.btn_optimize)
 
@@ -180,11 +209,12 @@ class OptimizationWidget(QWidget):
         root.addStretch()
 
     # ------------------------------------------------------------------
-    # Variable sync  (reads V-marked params from the system)
+    # Variable sync  (reads V/G-marked params from the system)
     # ------------------------------------------------------------------
     def _sync_variables(self):
-        """Rebuild the optimizer variable list from V-marked surfaces."""
+        """Rebuild the optimizer variable list from V/G-marked surfaces."""
         self.optimizer.variables.clear()
+        self.optimizer.material_variables.clear()
         lines = []
         for i, surf in enumerate(self.system.surfaces):
             if i == 0 or i == len(self.system.surfaces) - 1:
@@ -195,18 +225,29 @@ class OptimizationWidget(QWidget):
             if surf.thickness_solve == SolveType.VARIABLE:
                 self.optimizer.add_variable(i, "thickness", 0.1, 500.0)
                 lines.append(f"  Surf {i} Thickness = {surf.thickness:.4g}")
+            if surf.material_solve == SolveType.VARIABLE:
+                self.optimizer.add_material_variable(i)
+                lines.append(
+                    f"  Surf {i} Material = {surf.material} "
+                    f"<span style='color:#f9e2af;'>(glass var)</span>")
+
+        n_geom = len(self.optimizer.variables)
+        n_mat = len(self.optimizer.material_variables)
 
         if lines:
-            self.var_label.setText(
-                f"<b>{len(self.optimizer.variables)} variable(s)</b> "
-                f"detected from editor:<br>" + "<br>".join(lines))
+            header = f"<b>{n_geom} geometry + {n_mat} material variable(s)</b>"
+            self.var_label.setText(header + "<br>" + "<br>".join(lines))
             self.var_label.setStyleSheet("color: #a6e3a1;")  # green
         else:
             self.var_label.setText(
-                "No variables. Mark parameters with <b>V</b> in the editor "
-                "(e.g. type <code>61.47 V</code> in a Radius cell, or right-click "
-                "→ Make Radius Variable).")
+                "No variables. Mark parameters with <b>V</b> (geometry) or "
+                "<b>G</b> (material) in the editor.<br>"
+                "e.g. type <code>61.47 V</code> in Radius, or "
+                "<code>BK7 G</code> in Material, or right-click for toggles.")
             self.var_label.setStyleSheet("color: #f38ba8;")  # red hint
+
+        # Enable/disable glass sub button
+        self.btn_glass_sub.setEnabled(n_mat > 0)
 
     def update_from_editor(self):
         """Called by main window when the system changes."""
@@ -325,14 +366,15 @@ class OptimizationWidget(QWidget):
             self._refresh_operand_table()
 
     # ------------------------------------------------------------------
-    # Evaluate / Optimize
+    # Evaluate / Optimize / Glass Substitution
     # ------------------------------------------------------------------
     def _evaluate(self):
         self._sync_variables()
-        if not self.optimizer.variables:
+        if not self.optimizer.variables and not self.optimizer.material_variables:
             QMessageBox.information(self, "No Variables",
-                "Mark parameters with V in the editor first.\n\n"
-                "e.g. type '61.47 V' in a Radius cell.")
+                "Mark parameters with V or G in the editor first.\n\n"
+                "e.g. type '61.47 V' in a Radius cell,\n"
+                "or 'BK7 G' in a Material cell.")
             return
         if not self.optimizer.operands:
             QMessageBox.information(self, "No Operands",
@@ -343,11 +385,11 @@ class OptimizationWidget(QWidget):
 
     def _run(self):
         self._sync_variables()
-        if not self.optimizer.variables:
+        if not self.optimizer.variables and not self.optimizer.material_variables:
             QMessageBox.information(self, "No Variables",
-                "Mark parameters with V in the editor first.\n\n"
+                "Mark parameters with V or G in the editor first.\n\n"
                 "e.g. type '61.47 V' in a Radius cell, or right-click "
-                "→ Make Radius Variable.")
+                "\u2192 Make Radius/Material Variable.")
             return
         if not self.optimizer.operands:
             QMessageBox.information(self, "No Operands",
@@ -358,8 +400,7 @@ class OptimizationWidget(QWidget):
         self.optimizer.damping = self.damp_spin.value()
         max_iter = self.iter_spin.value()
 
-        self.btn_optimize.setEnabled(False)
-        self.btn_evaluate.setEnabled(False)
+        self._set_running(True)
         self.progress_bar.setMaximum(max_iter)
 
         self._thread = _OptThread(self.optimizer, max_iter)
@@ -367,16 +408,55 @@ class OptimizationWidget(QWidget):
         self._thread.finished_signal.connect(self._on_finished)
         self._thread.start()
 
+    def _run_glass_sub(self):
+        """Run brute-force glass substitution for G-marked materials."""
+        self._sync_variables()
+        if not self.optimizer.material_variables:
+            QMessageBox.information(self, "No Material Variables",
+                "Mark materials with G in the editor first.\n\n"
+                "e.g. type 'BK7 G' in a Material cell.")
+            return
+        if not self.optimizer.operands:
+            QMessageBox.information(self, "No Operands",
+                "Add operands first (click 'Default MF').")
+            return
+
+        # Estimate total evaluations
+        total = sum(
+            len(mv.glass_pool) if mv.glass_pool else len(GLASS_CATALOG)
+            for mv in self.optimizer.material_variables)
+
+        self._set_running(True)
+        self.progress_bar.setMaximum(total)
+
+        self._thread = _GlassSubThread(self.optimizer)
+        self._thread.progress.connect(self._on_progress_glass)
+        self._thread.finished_signal.connect(self._on_finished)
+        self._thread.start()
+
+    def _set_running(self, running: bool):
+        self.btn_optimize.setEnabled(not running)
+        self.btn_evaluate.setEnabled(not running)
+        self.btn_glass_sub.setEnabled(not running)
+
     def _on_progress(self, iteration, merit):
         self.progress_bar.setValue(iteration)
         self.merit_label.setText(f"Iteration {iteration}: Merit = {merit:.6f}")
 
-    def _on_finished(self, result: OptimizationResult):
-        self.btn_optimize.setEnabled(True)
-        self.btn_evaluate.setEnabled(True)
-        self.progress_bar.setValue(self.progress_bar.maximum())
+    def _on_progress_glass(self, eval_count, merit):
+        self.progress_bar.setValue(eval_count)
         self.merit_label.setText(
-            f"Done: {result.message} | Initial: {result.initial_merit:.6f} "
-            f"→ Final: {result.final_merit:.6f}")
+            f"Glass sub: {eval_count} tested, best merit = {merit:.6f}")
+
+    def _on_finished(self, result: OptimizationResult):
+        self._set_running(False)
+        self.progress_bar.setValue(self.progress_bar.maximum())
+
+        msg = (f"Done: {result.message} | Initial: {result.initial_merit:.6f} "
+               f"\u2192 Final: {result.final_merit:.6f}")
+        if result.glass_changes:
+            msg += "\nGlass: " + ", ".join(result.glass_changes)
+        self.merit_label.setText(msg)
+
         self._sync_variables()
         self.optimization_complete.emit()

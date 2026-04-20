@@ -8,12 +8,16 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                               QAbstractItemView)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 
-from ..engine.surface import LensSystem, SolveType
+from ..engine.surface import LensSystem, Surface, SolveType
 from ..engine.optimizer import Optimizer, OptimizationResult
 from ..engine.materials import (available_glasses, GLASS_CATALOG, Glass,
                                  add_custom_glass, remove_custom_glass,
                                  is_custom_glass, save_glass_catalog,
                                  load_glass_catalog)
+from ..engine.prefab import (PrefabElement, PREFAB_CATALOG, search_prefab,
+                              match_prefab, prefab_categories,
+                              save_prefab_catalog, load_prefab_catalog,
+                              add_prefab_element, remove_prefab_element)
 
 
 class SystemSettingsDialog(QDialog):
@@ -1298,3 +1302,468 @@ class _GlassEditDialog(QDialog):
             "C2": self.c_spins[1].value(),
             "C3": self.c_spins[2].value(),
         }
+
+
+# =========================================================================
+# Prefab Element Catalog Dialog
+# =========================================================================
+
+class PrefabCatalogDialog(QDialog):
+    """Browse, search, and insert prefab (stock) lens elements."""
+
+    element_selected = pyqtSignal(object)  # emits PrefabElement
+
+    def __init__(self, parent=None, select_mode=False,
+                 match_r1=None, match_r2=None, match_thickness=None,
+                 match_material=None, match_diameter=None):
+        super().__init__(parent)
+        self.setWindowTitle("Prefab Element Catalog")
+        self.setMinimumSize(780, 550)
+        self._select_mode = select_mode
+        self._match = {
+            "r1": match_r1, "r2": match_r2,
+            "thickness": match_thickness,
+            "material": match_material,
+            "diameter": match_diameter,
+        }
+        self.selected_element = None
+        self._setup_ui()
+        self._populate()
+        # If match params provided, auto-sort by similarity
+        if match_r1 is not None:
+            self._sort_by_match()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Search / filter bar
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Search:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Part number or description...")
+        self.search_edit.textChanged.connect(self._on_filter)
+        filter_row.addWidget(self.search_edit)
+
+        filter_row.addWidget(QLabel("Category:"))
+        self.cat_combo = QComboBox()
+        self.cat_combo.addItem("All", "")
+        for cat in prefab_categories():
+            self.cat_combo.addItem(cat.title(), cat)
+        self.cat_combo.currentIndexChanged.connect(self._on_filter)
+        filter_row.addWidget(self.cat_combo)
+
+        layout.addLayout(filter_row)
+
+        # Table
+        self.table = QTableWidget()
+        cols = ["Part #", "Description", "R1", "R2", "Thick", "Material",
+                "Dia", "Category", "EFL"]
+        self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels(cols)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.currentCellChanged.connect(self._on_selection)
+        self.table.doubleClicked.connect(self._on_double_click)
+
+        # Column widths
+        widths = [90, 160, 75, 75, 55, 70, 50, 85, 60]
+        for i, w in enumerate(widths):
+            self.table.setColumnWidth(i, w)
+        layout.addWidget(self.table)
+
+        # Detail label
+        self.detail_label = QLabel("")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setStyleSheet(
+            "padding: 4px; font-family: monospace; color: #cdd6f4;")
+        layout.addWidget(self.detail_label)
+
+        # Match info (if opened from "Find Similar Prefab")
+        if self._match.get("r1") is not None:
+            match_info = QLabel(
+                f"<i>Showing closest matches to: "
+                f"R1={self._fmt(self._match['r1'])} "
+                f"R2={self._fmt(self._match['r2'])} "
+                f"t={self._fmt(self._match['thickness'])} "
+                f"{self._match['material'] or ''} "
+                f"D={self._fmt(self._match['diameter'])}</i>")
+            match_info.setWordWrap(True)
+            match_info.setStyleSheet("color: #f9e2af; padding: 2px;")
+            layout.addWidget(match_info)
+
+        # Buttons
+        btns = QHBoxLayout()
+
+        btn_add = QPushButton("Add Custom...")
+        btn_add.setToolTip("Add a new prefab element to the catalog.")
+        btn_add.clicked.connect(self._add_element)
+        btns.addWidget(btn_add)
+
+        btn_del = QPushButton("Remove")
+        btn_del.setToolTip("Remove the selected prefab element.")
+        btn_del.clicked.connect(self._remove_element)
+        btns.addWidget(btn_del)
+
+        btns.addSpacing(10)
+
+        btn_load = QPushButton("Load Catalog...")
+        btn_load.clicked.connect(self._load_catalog)
+        btns.addWidget(btn_load)
+
+        btn_save = QPushButton("Save Catalog...")
+        btn_save.clicked.connect(self._save_catalog)
+        btns.addWidget(btn_save)
+
+        btns.addStretch()
+
+        if self._select_mode:
+            btn_select = QPushButton("Select")
+            btn_select.setObjectName("primaryButton")
+            btn_select.clicked.connect(self._select)
+            btns.addWidget(btn_select)
+
+        btn_close = QPushButton("Cancel" if self._select_mode else "Close")
+        btn_close.clicked.connect(self.reject)
+        btns.addWidget(btn_close)
+
+        layout.addLayout(btns)
+
+    def _populate(self):
+        """Fill the table from the current catalog."""
+        self.table.setRowCount(len(PREFAB_CATALOG))
+        for i, elem in enumerate(PREFAB_CATALOG):
+            self.table.setItem(i, 0, QTableWidgetItem(elem.part_number))
+            self.table.setItem(i, 1, QTableWidgetItem(elem.description))
+            self.table.setItem(i, 2, QTableWidgetItem(self._fmt(elem.r1)))
+            self.table.setItem(i, 3, QTableWidgetItem(self._fmt(elem.r2)))
+            self.table.setItem(i, 4, QTableWidgetItem(f"{elem.thickness:.2f}"))
+            mat = elem.material
+            if elem.is_doublet:
+                mat += f" / {elem.material2}"
+            self.table.setItem(i, 5, QTableWidgetItem(mat))
+            self.table.setItem(i, 6, QTableWidgetItem(f"{elem.diameter:.1f}"))
+            self.table.setItem(i, 7, QTableWidgetItem(elem.category))
+            efl_text = f"{elem.efl_nominal:.1f}" if elem.efl_nominal else "--"
+            self.table.setItem(i, 8, QTableWidgetItem(efl_text))
+
+            # Tint doublets
+            if elem.is_doublet:
+                from PyQt6.QtGui import QColor
+                for c in range(self.table.columnCount()):
+                    item = self.table.item(i, c)
+                    if item:
+                        item.setForeground(QColor("#89b4fa"))
+
+    def _sort_by_match(self):
+        """Sort table rows by similarity to match parameters."""
+        r1 = self._match.get("r1", float('inf'))
+        r2 = self._match.get("r2", float('inf'))
+        t = self._match.get("thickness", 5.0)
+        mat = self._match.get("material", "")
+        dia = self._match.get("diameter", 25.0)
+
+        matches = match_prefab(r1, r2, t, mat, dia,
+                               max_results=len(PREFAB_CATALOG))
+        # Rebuild table in match order
+        self.table.setRowCount(len(matches))
+        for i, (elem, score) in enumerate(matches):
+            self.table.setItem(i, 0, QTableWidgetItem(elem.part_number))
+            desc = elem.description
+            if score < 0.5:
+                desc = f"\u2705 {desc}"  # checkmark for close match
+            self.table.setItem(i, 1, QTableWidgetItem(desc))
+            self.table.setItem(i, 2, QTableWidgetItem(self._fmt(elem.r1)))
+            self.table.setItem(i, 3, QTableWidgetItem(self._fmt(elem.r2)))
+            self.table.setItem(i, 4, QTableWidgetItem(f"{elem.thickness:.2f}"))
+            mat_text = elem.material
+            if elem.is_doublet:
+                mat_text += f" / {elem.material2}"
+            self.table.setItem(i, 5, QTableWidgetItem(mat_text))
+            self.table.setItem(i, 6, QTableWidgetItem(f"{elem.diameter:.1f}"))
+            self.table.setItem(i, 7, QTableWidgetItem(elem.category))
+            efl_text = f"{elem.efl_nominal:.1f}" if elem.efl_nominal else "--"
+            self.table.setItem(i, 8, QTableWidgetItem(efl_text))
+
+            # Highlight close matches green
+            if score < 0.5:
+                from PyQt6.QtGui import QColor
+                for c in range(self.table.columnCount()):
+                    item = self.table.item(i, c)
+                    if item:
+                        item.setForeground(QColor("#a6e3a1"))
+
+    def _on_filter(self):
+        q = self.search_edit.text().upper()
+        cat = self.cat_combo.currentData() or ""
+        for i in range(self.table.rowCount()):
+            pn = self.table.item(i, 0)
+            desc = self.table.item(i, 1)
+            cat_item = self.table.item(i, 7)
+            text_match = (not q
+                          or (pn and q in pn.text().upper())
+                          or (desc and q in desc.text().upper()))
+            cat_match = (not cat
+                         or (cat_item and cat.lower() == cat_item.text().lower()))
+            self.table.setRowHidden(i, not (text_match and cat_match))
+
+    def _on_selection(self, row, col, prev_row, prev_col):
+        if row < 0:
+            self.detail_label.setText("")
+            return
+        # Find the element by part number
+        pn_item = self.table.item(row, 0)
+        if not pn_item:
+            return
+        pn = pn_item.text()
+        elem = None
+        for e in PREFAB_CATALOG:
+            if e.part_number == pn:
+                elem = e
+                break
+        if not elem:
+            return
+
+        lines = [
+            f"{elem.part_number}  —  {elem.description}",
+            f"R1 = {self._fmt(elem.r1)}    R2 = {self._fmt(elem.r2)}    "
+            f"Thickness = {elem.thickness:.3f} mm",
+            f"Material = {elem.material}    Diameter = {elem.diameter:.1f} mm",
+        ]
+        if elem.is_doublet:
+            lines.append(
+                f"R3 = {self._fmt(elem.r3)}    Thickness2 = {elem.thickness2:.3f}    "
+                f"Material2 = {elem.material2}")
+        if elem.efl_nominal:
+            lines.append(f"Nominal EFL = {elem.efl_nominal:.1f} mm")
+        if elem.coating:
+            lines.append(f"Coating: {elem.coating}")
+        if elem.notes:
+            lines.append(f"Notes: {elem.notes}")
+        self.detail_label.setText("\n".join(lines))
+
+    def _on_double_click(self):
+        if self._select_mode:
+            self._select()
+
+    def _select(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        pn_item = self.table.item(row, 0)
+        if not pn_item:
+            return
+        pn = pn_item.text()
+        for e in PREFAB_CATALOG:
+            if e.part_number == pn:
+                self.selected_element = e
+                self.element_selected.emit(e)
+                self.accept()
+                return
+
+    def _add_element(self):
+        dlg = _PrefabEditDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            elem = dlg.get_element()
+            add_prefab_element(elem)
+            self._populate()
+
+    def _remove_element(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        pn_item = self.table.item(row, 0)
+        if not pn_item:
+            return
+        pn = pn_item.text()
+        # Find index in PREFAB_CATALOG
+        for i, e in enumerate(PREFAB_CATALOG):
+            if e.part_number == pn:
+                reply = QMessageBox.question(
+                    self, "Remove Prefab",
+                    f"Remove '{pn}' from the catalog?",
+                    QMessageBox.StandardButton.Yes |
+                    QMessageBox.StandardButton.No)
+                if reply == QMessageBox.StandardButton.Yes:
+                    remove_prefab_element(i)
+                    self._populate()
+                return
+
+    def _load_catalog(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Prefab Catalog", "",
+            "Prefab Catalog (*.json);;All Files (*)")
+        if path:
+            try:
+                count = load_prefab_catalog(path)
+                self._populate()
+                QMessageBox.information(
+                    self, "Loaded", f"Loaded {count} prefab element(s).")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to load:\n{e}")
+
+    def _save_catalog(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Prefab Catalog", "prefab_catalog.json",
+            "Prefab Catalog (*.json);;All Files (*)")
+        if path:
+            try:
+                save_prefab_catalog(path)
+                QMessageBox.information(
+                    self, "Saved",
+                    f"Saved {len(PREFAB_CATALOG)} element(s) to {path}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to save:\n{e}")
+
+    @staticmethod
+    def _fmt(val):
+        if val is None:
+            return "--"
+        if abs(val) > 1e10:
+            return "Inf"
+        return f"{val:.4f}"
+
+
+class _PrefabEditDialog(QDialog):
+    """Add/edit a prefab element."""
+
+    def __init__(self, parent=None, element: PrefabElement = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Prefab Element" if element else "Add Prefab Element")
+        self.setMinimumWidth(420)
+        self._element = element
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        e = self._element
+
+        self.part_edit = QLineEdit(e.part_number if e else "")
+        self.part_edit.setPlaceholderText("e.g. PCX-25-100")
+        form.addRow("Part Number:", self.part_edit)
+
+        self.desc_edit = QLineEdit(e.description if e else "")
+        self.desc_edit.setPlaceholderText("e.g. Plano-convex f=100mm")
+        form.addRow("Description:", self.desc_edit)
+
+        self.r1_edit = QLineEdit(
+            self._fmt_val(e.r1) if e else "Infinity")
+        self.r1_edit.setToolTip("Front radius of curvature (mm). 'Infinity' for flat.")
+        form.addRow("R1 (mm):", self.r1_edit)
+
+        self.r2_edit = QLineEdit(
+            self._fmt_val(e.r2) if e else "Infinity")
+        self.r2_edit.setToolTip("Back radius of curvature (mm).")
+        form.addRow("R2 (mm):", self.r2_edit)
+
+        self.thick_spin = QDoubleSpinBox()
+        self.thick_spin.setRange(0.01, 500)
+        self.thick_spin.setDecimals(3)
+        self.thick_spin.setValue(e.thickness if e else 5.0)
+        form.addRow("Thickness (mm):", self.thick_spin)
+
+        self.mat_edit = QLineEdit(e.material if e else "BK7")
+        form.addRow("Material:", self.mat_edit)
+
+        self.dia_spin = QDoubleSpinBox()
+        self.dia_spin.setRange(0.1, 1000)
+        self.dia_spin.setDecimals(1)
+        self.dia_spin.setValue(e.diameter if e else 25.0)
+        form.addRow("Diameter (mm):", self.dia_spin)
+
+        self.cat_edit = QLineEdit(e.category if e else "")
+        self.cat_edit.setPlaceholderText(
+            "e.g. plano-convex, bi-convex, achromat, meniscus")
+        form.addRow("Category:", self.cat_edit)
+
+        self.efl_spin = QDoubleSpinBox()
+        self.efl_spin.setRange(-10000, 10000)
+        self.efl_spin.setDecimals(1)
+        self.efl_spin.setValue(e.efl_nominal if e else 0.0)
+        self.efl_spin.setToolTip("Nominal EFL in mm (0 = unknown).")
+        form.addRow("Nominal EFL:", self.efl_spin)
+
+        self.notes_edit = QLineEdit(e.notes if e else "")
+        form.addRow("Notes:", self.notes_edit)
+
+        layout.addLayout(form)
+
+        # Doublet group
+        dub_group = QGroupBox("Cemented Doublet (optional)")
+        dub_form = QFormLayout()
+
+        self.r3_edit = QLineEdit(
+            self._fmt_val(e.r3) if e and e.r3 else "0")
+        self.r3_edit.setToolTip("Third surface radius. Set 0 for singlet.")
+        dub_form.addRow("R3 (mm):", self.r3_edit)
+
+        self.thick2_spin = QDoubleSpinBox()
+        self.thick2_spin.setRange(0, 500)
+        self.thick2_spin.setDecimals(3)
+        self.thick2_spin.setValue(e.thickness2 if e else 0.0)
+        dub_form.addRow("Thickness2 (mm):", self.thick2_spin)
+
+        self.mat2_edit = QLineEdit(e.material2 if e else "")
+        dub_form.addRow("Material2:", self.mat2_edit)
+
+        dub_group.setLayout(dub_form)
+        layout.addWidget(dub_group)
+
+        # Buttons
+        btns = QHBoxLayout()
+        btns.addStretch()
+        btn_ok = QPushButton("OK")
+        btn_ok.setObjectName("primaryButton")
+        btn_ok.clicked.connect(self._validate_accept)
+        btns.addWidget(btn_ok)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
+    def _validate_accept(self):
+        if not self.part_edit.text().strip():
+            QMessageBox.warning(self, "Error", "Part number cannot be empty.")
+            return
+        self.accept()
+
+    def get_element(self) -> PrefabElement:
+        return PrefabElement(
+            part_number=self.part_edit.text().strip(),
+            description=self.desc_edit.text().strip(),
+            r1=self._parse_radius(self.r1_edit.text()),
+            r2=self._parse_radius(self.r2_edit.text()),
+            thickness=self.thick_spin.value(),
+            material=self.mat_edit.text().strip().upper(),
+            diameter=self.dia_spin.value(),
+            r3=self._parse_radius(self.r3_edit.text()),
+            thickness2=self.thick2_spin.value(),
+            material2=self.mat2_edit.text().strip().upper(),
+            category=self.cat_edit.text().strip().lower(),
+            efl_nominal=self.efl_spin.value(),
+            notes=self.notes_edit.text().strip(),
+        )
+
+    @staticmethod
+    def _parse_radius(text):
+        t = text.strip().lower()
+        if t in ("inf", "infinity", ""):
+            return float('inf')
+        try:
+            return float(t)
+        except ValueError:
+            return float('inf')
+
+    @staticmethod
+    def _fmt_val(v):
+        if abs(v) > 1e10:
+            return "Infinity"
+        return f"{v:.4f}"

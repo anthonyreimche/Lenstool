@@ -47,6 +47,7 @@ class Surface:
     # Solve
     radius_solve: SolveType = SolveType.FIXED
     thickness_solve: SolveType = SolveType.FIXED
+    material_solve: SolveType = SolveType.FIXED
 
     # Flags
     is_stop: bool = False

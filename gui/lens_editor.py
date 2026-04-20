@@ -122,8 +122,9 @@ class LensDataEditor(QWidget):
             else:
                 self._set_item(i, 3, f"{surf.thickness:.6f}{t_suffix}")
 
-            # Material
-            self._set_item(i, 4, surf.material)
+            # Material (append G if variable)
+            mat_suffix = "  G" if surf.material_solve == SolveType.VARIABLE else ""
+            self._set_item(i, 4, surf.material + mat_suffix)
 
             # Semi-Diameter
             self._set_item(i, 5, f"{surf.semi_diameter:.4f}")
@@ -154,6 +155,10 @@ class LensDataEditor(QWidget):
                 item = self.table.item(i, 3)
                 if item:
                     item.setForeground(QColor("#a6e3a1"))
+            if surf.material_solve == SolveType.VARIABLE:
+                item = self.table.item(i, 4)
+                if item:
+                    item.setForeground(QColor("#f9e2af"))  # yellow for glass variable
 
         self._updating = False
 
@@ -224,8 +229,22 @@ class LensDataEditor(QWidget):
                 else:
                     surf.thickness = float(val_text)
                 surf.thickness_solve = SolveType.VARIABLE if has_v else SolveType.FIXED
-            elif col == 4:  # Material
-                surf.material = text.upper()
+            elif col == 4:  # Material (detect G suffix for variable)
+                has_g = text.rstrip().upper().endswith("G")
+                mat_text = text.upper().replace(" G", "").replace("G", "").strip() if has_g else text.upper().strip()
+                # Only strip trailing G, not G inside glass names like "BK7"
+                if has_g and text.rstrip().upper()[-1] == "G":
+                    # Re-parse: take everything before the last token if it's "G"
+                    parts = text.strip().split()
+                    if parts and parts[-1].upper() == "G":
+                        mat_text = " ".join(parts[:-1]).upper()
+                    else:
+                        mat_text = text.upper().strip()
+                        has_g = False
+                else:
+                    mat_text = text.upper().strip()
+                surf.material = mat_text
+                surf.material_solve = SolveType.VARIABLE if has_g else SolveType.FIXED
             elif col == 5:  # Semi-Diameter
                 surf.semi_diameter = float(text)
             elif col == 6:  # Conic (strip "[A]" indicator if present)
@@ -324,6 +343,22 @@ class LensDataEditor(QWidget):
         make_variable_t.triggered.connect(lambda: self._toggle_variable(row, "thickness"))
         menu.addAction(make_variable_t)
 
+        make_variable_m = QAction("Make Material Variable", self)
+        make_variable_m.triggered.connect(lambda: self._toggle_variable(row, "material"))
+        make_variable_m.setEnabled(
+            0 < row < len(self.system.surfaces) - 1
+            and bool(self.system.surfaces[row].material)
+            and self.system.surfaces[row].material.upper() not in ("", "AIR"))
+        menu.addAction(make_variable_m)
+
+        menu.addSeparator()
+
+        # Find similar prefab element
+        find_prefab = QAction("Find Similar Prefab...", self)
+        find_prefab.triggered.connect(lambda: self._find_prefab_for_surface(row))
+        find_prefab.setEnabled(0 < row < len(self.system.surfaces) - 1)
+        menu.addAction(find_prefab)
+
         menu.exec(self.table.mapToGlobal(pos))
 
     def _insert_at(self, idx):
@@ -360,7 +395,32 @@ class LensDataEditor(QWidget):
                 surf.thickness_solve = SolveType.FIXED
             else:
                 surf.thickness_solve = SolveType.VARIABLE
+        elif param == "material":
+            if surf.material_solve == SolveType.VARIABLE:
+                surf.material_solve = SolveType.FIXED
+            else:
+                surf.material_solve = SolveType.VARIABLE
         self.refresh()
+        self.system_changed.emit()
+
+    def _find_prefab_for_surface(self, row):
+        """Open the prefab catalog filtered to match this surface's geometry."""
+        if row < 0 or row >= len(self.system.surfaces):
+            return
+        surf = self.system.surfaces[row]
+        # Find the back surface (next surface with different/no material)
+        r2 = float('inf')
+        for j in range(row + 1, len(self.system.surfaces)):
+            r2 = self.system.surfaces[j].radius
+            break
+        from .dialogs import PrefabCatalogDialog
+        dlg = PrefabCatalogDialog(
+            self, select_mode=True,
+            match_r1=surf.radius, match_r2=r2,
+            match_thickness=surf.thickness,
+            match_material=surf.material,
+            match_diameter=surf.semi_diameter * 2)
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Element detection and reordering

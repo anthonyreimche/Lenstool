@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from .surface import LensSystem, SolveType
 from .raytrace import trace_real_ray_2d, trace_paraxial_ray, compute_efl
 from .analysis import rms_spot_size
+from .materials import (GLASS_CATALOG, get_glass, find_nearest_glass,
+                        glass_nd_vd, available_glasses)
 
 
 @dataclass
@@ -38,6 +40,54 @@ class Variable:
 
 
 @dataclass
+class MaterialVariable:
+    """A material optimization variable — represents glass as (nd, vd).
+
+    During DLS, nd and vd are treated as two continuous variables.
+    After optimization, the nearest real catalog glass is selected.
+    *glass_pool* restricts the search to a subset of the catalog.
+    """
+    surface_idx: int
+    glass_pool: List[str] = field(default_factory=list)  # empty = all catalog
+
+    # Internal continuous representation
+    _nd: float = 0.0
+    _vd: float = 0.0
+
+    def sync_from_system(self, system: LensSystem):
+        """Read current glass nd/vd from the surface."""
+        mat = system.surfaces[self.surface_idx].material
+        self._nd, self._vd = glass_nd_vd(mat)
+
+    def get_values(self) -> Tuple[float, float]:
+        return self._nd, self._vd
+
+    def set_values(self, nd: float, vd: float):
+        self._nd = np.clip(nd, 1.3, 2.5)
+        self._vd = np.clip(vd, 15.0, 95.0)
+
+    def apply_nearest_glass(self, system: LensSystem) -> str:
+        """Snap to the nearest real catalog glass and apply it."""
+        pool = self.glass_pool or None
+        matches = find_nearest_glass(self._nd, self._vd, pool, max_results=1)
+        if matches:
+            name = matches[0][0]
+            system.surfaces[self.surface_idx].material = name
+            # Update internal values to match the snapped glass
+            g = get_glass(name)
+            if g:
+                self._nd, self._vd = g.nd, g.vd
+            return name
+        return system.surfaces[self.surface_idx].material
+
+    def best_glass_name(self) -> str:
+        """Return the name of the nearest glass without applying."""
+        pool = self.glass_pool or None
+        matches = find_nearest_glass(self._nd, self._vd, pool, max_results=1)
+        return matches[0][0] if matches else "?"
+
+
+@dataclass
 class Operand:
     """An optimization target/operand."""
     type: str  # "EFFL", "SPOT", "TRAY", "AXCL", "DIMX"
@@ -56,6 +106,7 @@ class OptimizationResult:
     iterations: int = 0
     converged: bool = False
     message: str = ""
+    glass_changes: List[str] = field(default_factory=list)
 
 
 class Optimizer:
@@ -64,6 +115,7 @@ class Optimizer:
     def __init__(self, system: LensSystem):
         self.system = system
         self.variables: List[Variable] = []
+        self.material_variables: List[MaterialVariable] = []
         self.operands: List[Operand] = []
         self.damping = 0.1
 
@@ -75,6 +127,17 @@ class Optimizer:
         if 0 <= index < len(self.variables):
             self.variables.pop(index)
 
+    def add_material_variable(self, surface_idx: int,
+                              glass_pool: List[str] = None):
+        """Add a material variable for the given surface."""
+        mv = MaterialVariable(surface_idx, glass_pool or [])
+        mv.sync_from_system(self.system)
+        self.material_variables.append(mv)
+
+    def remove_material_variable(self, index: int):
+        if 0 <= index < len(self.material_variables):
+            self.material_variables.pop(index)
+
     def add_operand(self, op_type: str, target: float = 0.0, weight: float = 1.0,
                     surface: int = -1, field_idx: int = 0, wave_idx: int = 0):
         self.operands.append(Operand(op_type, target, weight, surface, field_idx, wave_idx))
@@ -84,6 +147,7 @@ class Optimizer:
 
     def clear_variables(self):
         self.variables.clear()
+        self.material_variables.clear()
 
     def auto_set_variables(self):
         """Automatically set all radii and thicknesses as variables."""
@@ -151,16 +215,59 @@ class Optimizer:
             return efl2 - efl1
         return 0.0
 
+    # ------------------------------------------------------------------
+    # Build combined variable vector (continuous + material nd/vd)
+    # ------------------------------------------------------------------
+
+    def _get_full_vector(self) -> np.ndarray:
+        """Get combined parameter vector: [continuous vars..., nd1, vd1, nd2, vd2, ...]."""
+        vals = [v.get_value(self.system) for v in self.variables]
+        for mv in self.material_variables:
+            nd, vd = mv.get_values()
+            vals.extend([nd, vd])
+        return np.array(vals)
+
+    def _set_full_vector(self, x: np.ndarray):
+        """Apply combined parameter vector back to system."""
+        n_cont = len(self.variables)
+        for j, var in enumerate(self.variables):
+            var.set_value(self.system, x[j])
+        idx = n_cont
+        for mv in self.material_variables:
+            mv.set_values(x[idx], x[idx + 1])
+            # Apply the fictional nd/vd to the system via a temporary glass
+            self._apply_material_continuous(mv)
+            idx += 2
+
+    def _apply_material_continuous(self, mv: MaterialVariable):
+        """During optimization, approximate the glass at (nd, vd).
+
+        We modify the surface's material to the nearest catalog glass,
+        which gives us real Sellmeier dispersion for accurate ray tracing.
+        """
+        mv.apply_nearest_glass(self.system)
+
+    def _total_var_count(self) -> int:
+        return len(self.variables) + 2 * len(self.material_variables)
+
+    # ------------------------------------------------------------------
+    # Optimization
+    # ------------------------------------------------------------------
+
     def optimize(self, max_iterations: int = 50, tolerance: float = 1e-8,
                   callback: Optional[Callable] = None) -> OptimizationResult:
         """Run damped least squares optimization."""
         result = OptimizationResult()
 
-        if not self.variables or not self.operands:
+        n_total = self._total_var_count()
+        if n_total == 0 or not self.operands:
             result.message = "No variables or operands defined"
             return result
 
-        n_vars = len(self.variables)
+        # Sync material variables from current system state
+        for mv in self.material_variables:
+            mv.sync_from_system(self.system)
+
         n_ops = len(self.operands)
 
         result.initial_merit = self.evaluate_merit()
@@ -168,7 +275,7 @@ class Optimizer:
 
         for iteration in range(max_iterations):
             # Get current parameter vector
-            x = np.array([v.get_value(self.system) for v in self.variables])
+            x = self._get_full_vector()
 
             # Compute residuals
             r = self._compute_residuals()
@@ -178,19 +285,26 @@ class Optimizer:
                 callback(iteration, merit)
 
             # Compute Jacobian by finite differences
-            J = np.zeros((n_ops, n_vars))
+            J = np.zeros((n_ops, n_total))
             delta = 1e-6
 
-            for j in range(n_vars):
-                x_save = self.variables[j].get_value(self.system)
+            for j in range(n_total):
+                x_save = x[j]
 
-                # Forward perturbation
-                step = max(abs(x_save) * delta, delta)
-                self.variables[j].set_value(self.system, x_save + step)
+                # Choose appropriate step size
+                if j >= len(self.variables):
+                    # Material variable — use larger step for nd/vd
+                    step = max(abs(x_save) * 1e-4, 1e-4)
+                else:
+                    step = max(abs(x_save) * delta, delta)
+
+                x_pert = x.copy()
+                x_pert[j] = x_save + step
+                self._set_full_vector(x_pert)
                 r_plus = self._compute_residuals()
 
                 # Restore
-                self.variables[j].set_value(self.system, x_save)
+                self._set_full_vector(x)
 
                 J[:, j] = (r_plus - r) / step
 
@@ -212,8 +326,7 @@ class Optimizer:
 
                 # Apply update
                 x_new = x + dx
-                for j, var in enumerate(self.variables):
-                    var.set_value(self.system, x_new[j])
+                self._set_full_vector(x_new)
 
                 new_merit = self.evaluate_merit()
 
@@ -223,8 +336,7 @@ class Optimizer:
                     break
                 else:
                     # Revert
-                    for j, var in enumerate(self.variables):
-                        var.set_value(self.system, x[j])
+                    self._set_full_vector(x)
                     damping *= 10
             else:
                 result.message = "Failed to find descent direction"
@@ -238,8 +350,73 @@ class Optimizer:
 
             result.iterations = iteration + 1
 
+        # Final snap: apply nearest real glasses for all material variables
+        for mv in self.material_variables:
+            name = mv.apply_nearest_glass(self.system)
+            nd, vd = mv.get_values()
+            result.glass_changes.append(
+                f"Surf {mv.surface_idx}: {name} (nd={nd:.4f}, vd={vd:.1f})")
+
         result.final_merit = self.evaluate_merit()
         if not result.message:
             result.message = f"Completed {result.iterations} iterations"
 
+        return result
+
+    # ------------------------------------------------------------------
+    # Glass substitution (brute-force discrete search)
+    # ------------------------------------------------------------------
+
+    def glass_substitution(self, callback: Optional[Callable] = None
+                           ) -> OptimizationResult:
+        """Try every glass in each material variable's pool.
+
+        For each material variable, test all candidate glasses and keep
+        the one that gives the lowest merit.  This is a discrete search
+        that complements the continuous DLS optimization.
+        """
+        result = OptimizationResult()
+        result.initial_merit = self.evaluate_merit()
+
+        if not self.material_variables:
+            result.message = "No material variables"
+            return result
+
+        total_evals = sum(
+            len(mv.glass_pool) if mv.glass_pool else len(GLASS_CATALOG)
+            for mv in self.material_variables)
+        eval_count = 0
+
+        for mv in self.material_variables:
+            pool = mv.glass_pool if mv.glass_pool else list(GLASS_CATALOG.keys())
+            pool = [n for n in pool if n.upper() != "MIRROR"]
+
+            surf = self.system.surfaces[mv.surface_idx]
+            best_glass = surf.material
+            best_merit = self.evaluate_merit()
+
+            for glass_name in pool:
+                surf.material = glass_name
+                try:
+                    m = self.evaluate_merit()
+                except Exception:
+                    m = 1e10
+                if m < best_merit:
+                    best_merit = m
+                    best_glass = glass_name
+
+                eval_count += 1
+                if callback:
+                    callback(eval_count, best_merit)
+
+            surf.material = best_glass
+            mv.sync_from_system(self.system)
+            g = get_glass(best_glass)
+            if g:
+                result.glass_changes.append(
+                    f"Surf {mv.surface_idx}: {best_glass} "
+                    f"(nd={g.nd:.4f}, vd={g.vd:.1f})")
+
+        result.final_merit = self.evaluate_merit()
+        result.message = f"Tested {eval_count} glass combinations"
         return result
