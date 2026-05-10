@@ -1767,3 +1767,86 @@ class _PrefabEditDialog(QDialog):
         if abs(v) > 1e10:
             return "Infinity"
         return f"{v:.4f}"
+
+
+# =========================================================================
+# Application Settings Dialog
+# =========================================================================
+
+class AppSettingsDialog(QDialog):
+    """Application-level settings: undo buffer depth and other preferences.
+
+    Returned values are accessed via ``get_settings()`` after ``exec()``.
+    The caller (MainWindow) is responsible for applying them.
+    """
+
+    def __init__(self, parent=None,
+                 undo_depth: int = 100):
+        super().__init__(parent)
+        self.setWindowTitle("Application Settings")
+        self.setMinimumWidth(420)
+        self._setup_ui(undo_depth)
+
+    def _setup_ui(self, undo_depth):
+        layout = QVBoxLayout(self)
+
+        # ---- Undo / Redo ----
+        undo_group = QGroupBox("Undo / Redo")
+        undo_group.setToolTip(
+            "Controls the command history buffer used by Ctrl+Z / Ctrl+Y.")
+        form = QFormLayout(undo_group)
+
+        depth_lbl = QLabel("Buffer depth (steps):")
+        depth_lbl.setToolTip(
+            "Maximum number of undoable states kept in memory.\n"
+            "Each state is a full copy of the lens system (~a few KB).\n"
+            "Higher values use more RAM but allow undoing further back.\n"
+            "Typical range: 50–500.\n"
+            "Every committed cell edit creates its own undo step.")
+        self.depth_spin = QSpinBox()
+        self.depth_spin.setRange(1, 2000)
+        self.depth_spin.setValue(undo_depth)
+        self.depth_spin.setToolTip(depth_lbl.toolTip())
+        self.depth_spin.setSuffix("  steps")
+        form.addRow(depth_lbl, self.depth_spin)
+
+        layout.addWidget(undo_group)
+
+        # Info label
+        info = QLabel(
+            "Changes take effect immediately.  The current undo history "
+            "is not lost when you adjust the buffer depth.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #a6adc8; font-size: 11px; padding: 4px;")
+        layout.addWidget(info)
+
+        layout.addStretch()
+
+        # Buttons
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        btn_defaults = QPushButton("Restore Defaults")
+        btn_defaults.setToolTip("Reset all settings to their default values.")
+        btn_defaults.clicked.connect(self._restore_defaults)
+        btns.addWidget(btn_defaults)
+
+        btn_ok = QPushButton("OK")
+        btn_ok.setObjectName("primaryButton")
+        btn_ok.clicked.connect(self.accept)
+        btns.addWidget(btn_ok)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btns.addWidget(btn_cancel)
+
+        layout.addLayout(btns)
+
+    def _restore_defaults(self):
+        self.depth_spin.setValue(100)
+
+    def get_settings(self) -> dict:
+        """Return the chosen settings as a dict."""
+        return {
+            "undo_depth": self.depth_spin.value(),
+        }

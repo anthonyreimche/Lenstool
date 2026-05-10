@@ -59,7 +59,8 @@ class _GlassSubThread(QThread):
 class OptimizationWidget(QWidget):
     """Inline optimization panel that reads V/G-marked variables from the editor."""
 
-    optimization_complete = pyqtSignal()
+    optimization_starting = pyqtSignal()   # emitted just before the run starts
+    optimization_complete = pyqtSignal()   # emitted when the run finishes
 
     def __init__(self, system: LensSystem, parent=None):
         super().__init__(parent)
@@ -400,6 +401,7 @@ class OptimizationWidget(QWidget):
         self.optimizer.damping = self.damp_spin.value()
         max_iter = self.iter_spin.value()
 
+        self.optimization_starting.emit()
         self._set_running(True)
         self.progress_bar.setMaximum(max_iter)
 
@@ -426,6 +428,7 @@ class OptimizationWidget(QWidget):
             len(mv.glass_pool) if mv.glass_pool else len(GLASS_CATALOG)
             for mv in self.optimizer.material_variables)
 
+        self.optimization_starting.emit()
         self._set_running(True)
         self.progress_bar.setMaximum(total)
 

@@ -103,210 +103,26 @@ def load_lens(filepath: str) -> LensSystem:
     return system
 
 
-def create_sample_doublet() -> LensSystem:
-    """Create a sample cemented doublet lens."""
-    system = LensSystem.__new__(LensSystem)
-    system.title = "Cemented Doublet f/4"
-    system.notes = "Classic crown-flint achromatic doublet"
-    system.wavelengths = [0.4861, 0.5876, 0.6563]  # F, d, C lines
-    system.primary_wavelength_idx = 1
-    system.fields = [0.0, 3.5, 5.0]
-    system.field_type = "angle"
-    system.entrance_pupil_diameter = 25.0
+def load_lens_library(folder: str) -> list:
+    """Scan *folder* for .lens files and return a list of (title, filepath).
 
-    system.surfaces = [
-        Surface(comment="OBJ", thickness=1e10, semi_diameter=0.0),
-        Surface(comment="", radius=61.47, thickness=6.0, material="N-BK7",
-                semi_diameter=14.0),
-        Surface(comment="", radius=-43.28, thickness=2.5, material="N-SF5",
-                semi_diameter=14.0),
-        Surface(comment="", radius=-124.6, thickness=90.0, material="",
-                semi_diameter=14.0),
-        Surface(comment="STO", is_stop=True, thickness=5.0, semi_diameter=12.5),
-        Surface(comment="IMA", semi_diameter=15.0),
-    ]
-
-    return system
+    Used by the Sample Lenses menu to discover user-created designs.
+    Returns an empty list if the folder does not exist.
+    """
+    import glob
+    if not os.path.isdir(folder):
+        return []
+    files = sorted(glob.glob(os.path.join(folder, "*.lens")))
+    results = []
+    for fp in files:
+        try:
+            with open(fp, "r") as f:
+                import json as _json
+                data = _json.load(f)
+            title = data.get("title", os.path.splitext(os.path.basename(fp))[0])
+            results.append((title, fp))
+        except Exception:
+            results.append((os.path.basename(fp), fp))
+    return results
 
 
-def create_sample_cooke_triplet() -> LensSystem:
-    """Create a Cooke triplet (positive-negative-positive) lens."""
-    system = LensSystem.__new__(LensSystem)
-    system.title = "Cooke Triplet f/7"
-    system.notes = "Classic three-element anastigmat"
-    system.wavelengths = [0.4861, 0.5876, 0.6563]
-    system.primary_wavelength_idx = 1
-    system.fields = [0.0, 10.0, 20.0]
-    system.field_type = "angle"
-    system.entrance_pupil_diameter = 10.0
-
-    system.surfaces = [
-        Surface(comment="OBJ", thickness=1e10),
-        Surface(comment="L1", radius=26.10, thickness=3.50, material="SK16",
-                semi_diameter=7.5),
-        Surface(comment="", radius=146.50, thickness=6.00, material="",
-                semi_diameter=7.5),
-        Surface(comment="L2 STO", radius=-44.40, thickness=1.20, material="F2",
-                semi_diameter=4.5, is_stop=True),
-        Surface(comment="", radius=26.10, thickness=5.50, material="",
-                semi_diameter=4.5),
-        Surface(comment="L3", radius=81.50, thickness=3.50, material="SK16",
-                semi_diameter=7.5),
-        Surface(comment="", radius=-30.20, thickness=0.0, material="",
-                semi_diameter=7.5),
-        Surface(comment="IMA", semi_diameter=20.0),
-    ]
-
-    _auto_bfl(system)
-    return system
-
-
-def create_sample_petzval() -> LensSystem:
-    """Create a Petzval-type lens (two separated doublets)."""
-    system = LensSystem.__new__(LensSystem)
-    system.title = "Petzval Lens f/3.5"
-    system.notes = "Two separated positive groups"
-    system.wavelengths = [0.4861, 0.5876, 0.6563]
-    system.primary_wavelength_idx = 1
-    system.fields = [0.0, 5.0, 10.0]
-    system.field_type = "angle"
-    system.entrance_pupil_diameter = 14.0
-
-    system.surfaces = [
-        Surface(comment="OBJ", thickness=1e10),
-        Surface(comment="STO", radius=45.0, thickness=4.50, material="SK16",
-                semi_diameter=9.0, is_stop=True),
-        Surface(comment="", radius=-45.0, thickness=1.50, material="F2",
-                semi_diameter=9.0),
-        Surface(comment="", radius=-175.0, thickness=20.00, material="",
-                semi_diameter=9.0),
-        Surface(comment="", radius=30.0, thickness=4.00, material="SK16",
-                semi_diameter=8.0),
-        Surface(comment="", radius=-60.0, thickness=1.50, material="F2",
-                semi_diameter=8.0),
-        Surface(comment="", radius=-200.0, thickness=0.0, material="",
-                semi_diameter=8.0),
-        Surface(comment="IMA", semi_diameter=18.0),
-    ]
-
-    _auto_bfl(system)
-    return system
-
-
-def create_sample_telephoto() -> LensSystem:
-    """Create a telephoto lens (positive front, negative rear)."""
-    system = LensSystem.__new__(LensSystem)
-    system.title = "Telephoto"
-    system.notes = "Two-group telephoto with short total track"
-    system.wavelengths = [0.4861, 0.5876, 0.6563]
-    system.primary_wavelength_idx = 1
-    system.fields = [0.0, 2.0, 4.0]
-    system.field_type = "angle"
-    system.entrance_pupil_diameter = 20.0
-
-    system.surfaces = [
-        Surface(comment="OBJ", thickness=1e10),
-        Surface(comment="STO L1a", radius=38.0, thickness=6.0, material="N-BK7",
-                semi_diameter=14.0, is_stop=True),
-        Surface(comment="L1b", radius=-28.0, thickness=2.0, material="N-SF5",
-                semi_diameter=14.0),
-        Surface(comment="", radius=-80.0, thickness=45.0, material="",
-                semi_diameter=14.0),
-        Surface(comment="L2", radius=-100.0, thickness=2.0, material="N-BK7",
-                semi_diameter=8.0),
-        Surface(comment="", radius=300.0, thickness=0.0, material="",
-                semi_diameter=8.0),
-        Surface(comment="IMA", semi_diameter=15.0),
-    ]
-
-    _auto_bfl(system)
-    return system
-
-
-def create_sample_landscape() -> LensSystem:
-    """Create a landscape (meniscus) lens with front stop."""
-    system = LensSystem.__new__(LensSystem)
-    system.title = "Landscape Lens"
-    system.notes = "Single meniscus with remote stop for field correction"
-    system.wavelengths = [0.4861, 0.5876, 0.6563]
-    system.primary_wavelength_idx = 1
-    system.fields = [0.0, 10.0, 20.0]
-    system.field_type = "angle"
-    system.entrance_pupil_diameter = 5.0
-
-    system.surfaces = [
-        Surface(comment="OBJ", thickness=1e10),
-        Surface(comment="STO", is_stop=True, thickness=10.0, semi_diameter=4.0),
-        Surface(comment="L1", radius=-80.0, thickness=3.0, material="N-BK7",
-                semi_diameter=8.0),
-        Surface(comment="", radius=-25.0, thickness=0.0, material="",
-                semi_diameter=8.0),
-        Surface(comment="IMA", semi_diameter=25.0),
-    ]
-
-    _auto_bfl(system)
-    return system
-
-
-def create_sample_singlet() -> LensSystem:
-    """Create a simple plano-convex singlet."""
-    system = LensSystem.__new__(LensSystem)
-    system.title = "Plano-Convex Singlet f/5"
-    system.notes = "Simple singlet lens"
-    system.wavelengths = [0.4861, 0.5876, 0.6563]
-    system.primary_wavelength_idx = 1
-    system.fields = [0.0, 5.0, 10.0]
-    system.field_type = "angle"
-    system.entrance_pupil_diameter = 20.0
-
-    system.surfaces = [
-        Surface(comment="OBJ", thickness=1e10),
-        Surface(comment="STO", radius=51.68, thickness=5.0, material="BK7",
-                semi_diameter=12.0, is_stop=True),
-        Surface(comment="", radius=float('inf'), thickness=96.70, material="",
-                semi_diameter=12.0),
-        Surface(comment="IMA", semi_diameter=20.0),
-    ]
-
-    return system
-
-
-def create_sample_double_gauss() -> LensSystem:
-    """Create a simplified Double Gauss (Biotar-type) lens."""
-    system = LensSystem.__new__(LensSystem)
-    system.title = "Double Gauss f/2.8"
-    system.notes = "4-element symmetric Double Gauss"
-    system.wavelengths = [0.4861, 0.5876, 0.6563]
-    system.primary_wavelength_idx = 1
-    system.fields = [0.0, 7.0, 14.0]
-    system.field_type = "angle"
-    system.entrance_pupil_diameter = 18.0
-
-    system.surfaces = [
-        Surface(comment="OBJ", thickness=1e10),
-        Surface(comment="L1", radius=56.20, thickness=5.40, material="LAK9",
-                semi_diameter=14.0),
-        Surface(comment="", radius=152.0, thickness=0.50, material="",
-                semi_diameter=14.0),
-        Surface(comment="L2", radius=37.80, thickness=6.50, material="LAK9",
-                semi_diameter=13.0),
-        Surface(comment="L2b", radius=137.0, thickness=2.00, material="SF2",
-                semi_diameter=12.0),
-        Surface(comment="", radius=24.20, thickness=8.00, material="",
-                semi_diameter=9.5),
-        Surface(comment="STO", thickness=8.00, semi_diameter=9.0, is_stop=True),
-        Surface(comment="L3", radius=-23.50, thickness=2.00, material="SF2",
-                semi_diameter=9.5),
-        Surface(comment="L3b", radius=-131.0, thickness=6.00, material="LAK9",
-                semi_diameter=12.0),
-        Surface(comment="", radius=-36.26, thickness=0.50, material="",
-                semi_diameter=13.0),
-        Surface(comment="L4", radius=530.0, thickness=4.50, material="LAK9",
-                semi_diameter=13.5),
-        Surface(comment="", radius=-54.60, thickness=0.0, material="",
-                semi_diameter=13.5),
-        Surface(comment="IMA", semi_diameter=22.0),
-    ]
-
-    _auto_bfl(system)
-    return system

@@ -2,7 +2,7 @@
 
 import os
 
-from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -21,19 +21,10 @@ from PyQt6.QtWidgets import (
 )
 
 from ..engine.analysis import system_summary
-from ..engine.fileio import (
-    create_sample_cooke_triplet,
-    create_sample_double_gauss,
-    create_sample_doublet,
-    create_sample_landscape,
-    create_sample_petzval,
-    create_sample_singlet,
-    create_sample_telephoto,
-    load_lens,
-    save_lens,
-)
+from ..engine.fileio import load_lens, load_lens_library, save_lens
 from ..engine.raytrace import compute_efl
 from ..engine.surface import LensSystem
+from ..engine.undo import UndoManager
 from .analysis_plots import (
     FieldCurvatureWidget,
     MTFWidget,
@@ -41,7 +32,8 @@ from .analysis_plots import (
     SpotDiagramWidget,
     SystemInfoWidget,
 )
-from .dialogs import GlassCatalogDialog, PrefabCatalogDialog, SystemSettingsDialog
+from .dialogs import (AppSettingsDialog, GlassCatalogDialog,
+                      PrefabCatalogDialog, SystemSettingsDialog)
 from .layout_viewer import LayoutViewer
 from .lens_editor import LensDataEditor
 from .optimization_widget import OptimizationWidget
@@ -51,10 +43,20 @@ from .theme import DARK_STYLESHEET
 class MainWindow(QMainWindow):
     """LensTool main application window."""
 
+    # Defaults — overridable via Tools → Application Settings
+    UNDO_MAX_DEPTH = 100
+
+    # Folder scanned for user .lens files shown in File → Lens Library
+    LENS_LIBRARY_FOLDER = os.path.join(
+        os.path.expanduser("~"), "Documents", "LensTool", "Library")
+
     def __init__(self):
         super().__init__()
-        self.system = create_sample_doublet()
+        self.system = LensSystem()   # start with a blank system
         self.current_file = None
+        self.undo_manager = UndoManager(max_depth=self.UNDO_MAX_DEPTH)
+        self._applying_undo = False      # guard against re-entrant pushes
+        self._pre_edit_snapshot = None   # snapshot taken before first edit in a burst
 
         self.setWindowTitle("LensTool - Optical Lens Design")
         self.setMinimumSize(1200, 750)
@@ -95,38 +97,14 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        # Sample lenses submenu
-        samples_menu = file_menu.addMenu("Sample Lenses")
+        # Lens Library submenu — populated from ~/Documents/LensTool/Library
+        self.library_menu = file_menu.addMenu("Lens Library")
+        self.library_menu.aboutToShow.connect(self._populate_library_menu)
 
-        singlet = QAction("Plano-Convex Singlet", self)
-        singlet.triggered.connect(lambda: self._load_sample(create_sample_singlet))
-        samples_menu.addAction(singlet)
-
-        doublet = QAction("Cemented Doublet", self)
-        doublet.triggered.connect(lambda: self._load_sample(create_sample_doublet))
-        samples_menu.addAction(doublet)
-
-        triplet = QAction("Cooke Triplet", self)
-        triplet.triggered.connect(
-            lambda: self._load_sample(create_sample_cooke_triplet)
-        )
-        samples_menu.addAction(triplet)
-
-        dgauss = QAction("Double Gauss", self)
-        dgauss.triggered.connect(lambda: self._load_sample(create_sample_double_gauss))
-        samples_menu.addAction(dgauss)
-
-        petzval = QAction("Petzval Lens", self)
-        petzval.triggered.connect(lambda: self._load_sample(create_sample_petzval))
-        samples_menu.addAction(petzval)
-
-        telephoto = QAction("Telephoto", self)
-        telephoto.triggered.connect(lambda: self._load_sample(create_sample_telephoto))
-        samples_menu.addAction(telephoto)
-
-        landscape = QAction("Landscape Meniscus", self)
-        landscape.triggered.connect(lambda: self._load_sample(create_sample_landscape))
-        samples_menu.addAction(landscape)
+        self._library_folder_action = QAction("Set Library Folder...", self)
+        self._library_folder_action.triggered.connect(self._set_library_folder)
+        self.library_menu.addAction(self._library_folder_action)
+        self.library_menu.addSeparator()
 
         file_menu.addSeparator()
 
@@ -137,6 +115,20 @@ class MainWindow(QMainWindow):
 
         # Edit menu
         edit_menu = menubar.addMenu("&Edit")
+
+        self.undo_action = QAction("&Undo", self)
+        self.undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        self.undo_action.triggered.connect(self._undo)
+        self.undo_action.setEnabled(False)
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("&Redo", self)
+        self.redo_action.setShortcut(QKeySequence("Ctrl+Y"))
+        self.redo_action.triggered.connect(self._redo)
+        self.redo_action.setEnabled(False)
+        edit_menu.addAction(self.redo_action)
+
+        edit_menu.addSeparator()
 
         insert_surf = QAction("Insert Surface", self)
         insert_surf.setShortcut(QKeySequence("Ctrl+Insert"))
@@ -203,6 +195,12 @@ class MainWindow(QMainWindow):
         opt_action.triggered.connect(self._show_optimization)
         tools_menu.addAction(opt_action)
 
+        tools_menu.addSeparator()
+
+        app_settings_action = QAction("Application Settings...", self)
+        app_settings_action.triggered.connect(self._show_app_settings)
+        tools_menu.addAction(app_settings_action)
+
         # View menu
         view_menu = menubar.addMenu("&View")
 
@@ -228,6 +226,9 @@ class MainWindow(QMainWindow):
             ("Open", self._open_file),
             ("Save", self._save_file),
             None,  # separator
+            ("Undo", self._undo),
+            ("Redo", self._redo),
+            None,
             ("Settings", self._show_system_settings),
             ("Glass", self._show_glass_catalog),
             ("Prefab", self._show_prefab_catalog),
@@ -289,6 +290,7 @@ class MainWindow(QMainWindow):
         self.analysis_tabs.addTab(self.info_widget, "System Info")
 
         self.opt_widget = OptimizationWidget(self.system)
+        self.opt_widget.optimization_starting.connect(self._on_optimization_starting)
         self.opt_widget.optimization_complete.connect(self._on_optimization_complete)
         self.analysis_tabs.addTab(self.opt_widget, "Optimize")
 
@@ -337,6 +339,8 @@ class MainWindow(QMainWindow):
         self._update_status()
         self._update_title()
         self.opt_widget.update_from_editor()
+        if not self._applying_undo:
+            self._push_undo("Edit")
 
     def _on_editor_surface_selected(self, index: int):
         """Editor row selected -> highlight in layout."""
@@ -390,11 +394,80 @@ class MainWindow(QMainWindow):
         self.opt_widget.set_system(system)
         self._refresh_all()
 
+    # === Undo / Redo ===
+
+    def _push_undo(self, label: str = ""):
+        """Push a pre-edit snapshot onto the undo stack immediately.
+
+        The snapshot is the state captured just before the current
+        mutation was applied.  Because ``_on_system_changed`` fires
+        *after* the edit, we maintain ``_pre_edit_snapshot`` — a copy
+        taken at the end of the *previous* push — so we always store
+        the state the user was in before this edit.
+        """
+        # Commit the pre-edit snapshot (state before this edit)
+        if self._pre_edit_snapshot is not None:
+            self.undo_manager.save_state_snapshot(
+                self._pre_edit_snapshot, label)
+            self._update_undo_actions()
+
+        # Capture the post-edit state now; it becomes the pre-edit
+        # snapshot for the *next* mutation.
+        self._pre_edit_snapshot = self.undo_manager._deep_copy(self.system)
+
+    def _undo(self):
+        restored = self.undo_manager.undo(self.system)
+        if restored is None:
+            self.statusbar.showMessage("Nothing to undo.", 2000)
+            return
+        self._applying_undo = True
+        try:
+            self._set_system(restored)
+        finally:
+            self._applying_undo = False
+        self._update_undo_actions()
+        depth = self.undo_manager.undo_depth
+        self.statusbar.showMessage(
+            f"Undo  ({depth} step{'s' if depth != 1 else ''} remaining)", 2000)
+
+    def _redo(self):
+        restored = self.undo_manager.redo(self.system)
+        if restored is None:
+            self.statusbar.showMessage("Nothing to redo.", 2000)
+            return
+        self._applying_undo = True
+        try:
+            self._set_system(restored)
+        finally:
+            self._applying_undo = False
+        self._update_undo_actions()
+        depth = self.undo_manager.redo_depth
+        self.statusbar.showMessage(
+            f"Redo  ({depth} step{'s' if depth != 1 else ''} remaining)", 2000)
+
+    def _update_undo_actions(self):
+        """Refresh undo/redo menu text and enabled state."""
+        can_u = self.undo_manager.can_undo
+        can_r = self.undo_manager.can_redo
+
+        self.undo_action.setEnabled(can_u)
+        self.redo_action.setEnabled(can_r)
+
+        u_label = self.undo_manager.undo_label
+        self.undo_action.setText(
+            f"&Undo  {u_label}" if u_label else "&Undo")
+        r_label = self.undo_manager.redo_label
+        self.redo_action.setText(
+            f"&Redo  {r_label}" if r_label else "&Redo")
+
     # === File Operations ===
 
     def _new_system(self):
         self.current_file = None
+        self.undo_manager.clear()
+        self._pre_edit_snapshot = None
         self._set_system(LensSystem())
+        self._update_undo_actions()
 
     def _open_file(self):
         filepath, _ = QFileDialog.getOpenFileName(
@@ -404,7 +477,10 @@ class MainWindow(QMainWindow):
             try:
                 system = load_lens(filepath)
                 self.current_file = filepath
+                self.undo_manager.clear()
+                self._pre_edit_snapshot = None
                 self._set_system(system)
+                self._update_undo_actions()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open file:\n{e}")
 
@@ -434,15 +510,94 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
 
-    def _load_sample(self, factory_func):
-        self.current_file = None
-        self._set_system(factory_func())
+    def _load_library_lens(self, filepath: str):
+        """Load a .lens file from the user's lens library."""
+        try:
+            system = load_lens(filepath)
+            self.current_file = filepath
+            self.undo_manager.clear()
+            self._pre_edit_snapshot = None
+            self._set_system(system)
+            self._update_undo_actions()
+            self.statusbar.showMessage(
+                f"Loaded: {os.path.basename(filepath)}", 3000)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Load Error",
+                f"Could not load lens file:\n{filepath}\n\n{e}")
+
+    # === Lens Library ===
+
+    def _populate_library_menu(self):
+        """Rebuild the dynamic entries in the Lens Library menu.
+
+        Called every time the menu is about to be shown so that the list
+        is always up to date without requiring a restart.
+        """
+        # Remove all actions except the permanent ones:
+        # "Set Library Folder..." and its following separator.
+        permanent = {self._library_folder_action}
+        to_remove = []
+        passed_separator = False
+        for action in self.library_menu.actions():
+            if action in permanent:
+                continue
+            if action.isSeparator() and not passed_separator:
+                passed_separator = True   # keep the first separator
+                continue
+            to_remove.append(action)
+
+        for action in to_remove:
+            self.library_menu.removeAction(action)
+
+        # Update folder action tooltip with current path
+        self._library_folder_action.setToolTip(
+            f"Current folder: {self.LENS_LIBRARY_FOLDER}\n"
+            "Save .lens files there to have them appear in this menu.")
+
+        # Scan the library folder
+        entries = load_lens_library(self.LENS_LIBRARY_FOLDER)
+
+        if not entries:
+            no_files = QAction(
+                f"(No .lens files found in library folder)", self)
+            no_files.setEnabled(False)
+            self.library_menu.addAction(no_files)
+
+            hint = QAction(
+                f"  Folder: {self.LENS_LIBRARY_FOLDER}", self)
+            hint.setEnabled(False)
+            self.library_menu.addAction(hint)
+        else:
+            for title, filepath in entries:
+                action = QAction(title, self)
+                action.setToolTip(filepath)
+                action.triggered.connect(
+                    lambda checked, fp=filepath: self._load_library_lens(fp))
+                self.library_menu.addAction(action)
+
+    def _set_library_folder(self):
+        """Let the user pick a new library folder via a directory dialog."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Lens Library Folder",
+            self.LENS_LIBRARY_FOLDER,
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if folder:
+            self.LENS_LIBRARY_FOLDER = folder   # instance var shadows class var
+            self.statusbar.showMessage(
+                f"Lens library folder set to: {folder}", 4000)
 
     # === Dialogs ===
 
     def _show_system_settings(self):
+        # Snapshot before settings change so it's undoable
+        snap = self.undo_manager._deep_copy(self.system)
         dlg = SystemSettingsDialog(self.system, self)
         if dlg.exec():
+            self.undo_manager.save_state_snapshot(snap, "System Settings")
+            self._update_undo_actions()
             self._refresh_all()
 
     def _show_glass_catalog(self):
@@ -454,6 +609,21 @@ class MainWindow(QMainWindow):
         dlg = PrefabCatalogDialog(self, select_mode=False)
         dlg.exec()
 
+    def _show_app_settings(self):
+        dlg = AppSettingsDialog(
+            self,
+            undo_depth=self.undo_manager.max_depth,
+        )
+        if dlg.exec():
+            s = dlg.get_settings()
+            self.undo_manager.max_depth = s["undo_depth"]
+            # Trim the stack if the new depth is smaller
+            while len(self.undo_manager._undo_stack) > self.undo_manager.max_depth:
+                self.undo_manager._undo_stack.pop(0)
+            self._update_undo_actions()
+            self.statusbar.showMessage(
+                f"Settings saved — undo buffer: {s['undo_depth']} steps", 3000)
+
     def _show_optimization(self):
         """Switch to the Optimize tab in the analysis panel."""
         # Find the optimize tab index
@@ -463,12 +633,22 @@ class MainWindow(QMainWindow):
                 break
         self.opt_widget.update_from_editor()
 
+    def _on_optimization_starting(self):
+        """Snapshot BEFORE optimization so undo restores the pre-opt state."""
+        snap = self.undo_manager._deep_copy(self.system)
+        self.undo_manager.save_state_snapshot(snap, "Optimize")
+        self._update_undo_actions()
+
     def _on_optimization_complete(self):
         """Called after an optimization run finishes."""
-        self.editor.refresh()
-        self.layout_viewer.refresh()
-        self._update_status()
-        self._update_title()
+        self._applying_undo = True   # suppress re-push from set_system
+        try:
+            self.editor.refresh()
+            self.layout_viewer.refresh()
+            self._update_status()
+            self._update_title()
+        finally:
+            self._applying_undo = False
 
     def _show_about(self):
         QMessageBox.about(
@@ -482,9 +662,11 @@ class MainWindow(QMainWindow):
             "<li>Spot diagrams, MTF, ray fans</li>"
             "<li>Field curvature & distortion</li>"
             "<li>Seidel aberration analysis</li>"
-            "<li>DLS optimization</li>"
+            "<li>DLS optimization with glass substitution</li>"
             "<li>Glass catalog (Sellmeier)</li>"
-            "<li>Sample lens library</li>"
+            "<li>Prefab element catalog</li>"
+            "<li>User lens library (File → Lens Library)</li>"
+            "<li>Undo / Redo (Ctrl+Z / Ctrl+Y)</li>"
             "<p>Created by Anthony Reimche</p>"
             "</ul>",
         )
